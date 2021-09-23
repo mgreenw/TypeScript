@@ -263,6 +263,12 @@ namespace ts {
         Uncapitalize: IntrinsicTypeKind.Uncapitalize
     }));
 
+    const enum MemberOverrideDiagnostic {
+        Ok,
+        NeedsOverride,
+        HasInvalidOverride
+    }
+
     function SymbolLinks(this: SymbolLinks) {
     }
 
@@ -720,6 +726,7 @@ namespace ts {
             getLocalTypeParametersOfClassOrInterfaceOrTypeAlias,
             isDeclarationVisible,
             isPropertyAccessible,
+            getMemberOverrideModifierDiagnostic,
         };
 
         function getResolvedSignatureWorker(nodeIn: CallLikeExpression, candidatesOutArray: Signature[] | undefined, argumentCount: number | undefined, checkMode: CheckMode): Signature | undefined {
@@ -37819,7 +37826,6 @@ namespace ts {
         }
 
         function checkMembersForMissingOverrideModifier(node: ClassLikeDeclaration, type: InterfaceType, typeWithThis: Type, staticType: ObjectType) {
-            const nodeInAmbientContext = !!(node.flags & NodeFlags.Ambient);
             const baseTypeNode = getEffectiveBaseTypeNode(node);
             const baseTypes = baseTypeNode && getBaseTypes(type);
             const baseWithThis = baseTypes?.length ? getTypeWithThisArgument(first(baseTypes), type.thisType) : undefined;
@@ -37833,56 +37839,99 @@ namespace ts {
                 if (isConstructorDeclaration(member)) {
                     forEach(member.parameters, param => {
                         if (isParameterPropertyDeclaration(param, member)) {
-                            checkClassMember(param, /*memberIsParameterProperty*/ true);
+                            checkMemberForMissingOverrideModifier(
+                                node,
+                                staticType,
+                                baseStaticType,
+                                baseWithThis,
+                                type,
+                                typeWithThis,
+                                param,
+                                /* memberIsParameterProperty */ true
+                            );
                         }
                     });
                 }
-                checkClassMember(member);
+                checkMemberForMissingOverrideModifier(
+                    node,
+                    staticType,
+                    baseStaticType,
+                    baseWithThis,
+                    type,
+                    typeWithThis,
+                    member,
+                    /* memberIsParameterProperty */ false,
+                );
             }
+        }
 
-            function checkClassMember(member: ClassElement | ParameterPropertyDeclaration, memberIsParameterProperty?: boolean) {
-                const hasOverride = hasOverrideModifier(member);
-                const hasStatic = isStatic(member);
-                if (baseWithThis && (hasOverride || compilerOptions.noImplicitOverride)) {
-                    const declaredProp = member.name && getSymbolAtLocation(member.name) || getSymbolAtLocation(member);
-                    if (!declaredProp) {
-                        return;
-                    }
+        function checkMemberForMissingOverrideModifier(
+            node: ClassLikeDeclaration,
+            staticType: ObjectType,
+            baseStaticType: Type,
+            baseWithThis: Type | undefined,
+            type: InterfaceType,
+            typeWithThis: Type,
+            member: ClassElement | ParameterPropertyDeclaration,
+            memberIsParameterProperty: boolean,
+            reportErrors = true,
+        ): MemberOverrideDiagnostic {
+            const nodeInAmbientContext = !!(node.flags & NodeFlags.Ambient);
+            const hasOverride = hasOverrideModifier(member);
+            const hasStatic = isStatic(member);
+            if (baseWithThis && (hasOverride || compilerOptions.noImplicitOverride)) {
+                const declaredProp = member.name && getSymbolAtLocation(member.name) || getSymbolAtLocation(member);
+                if (!declaredProp) {
+                    return MemberOverrideDiagnostic.Ok;
+                }
 
-                    const thisType = hasStatic ? staticType : typeWithThis;
-                    const baseType = hasStatic ? baseStaticType : baseWithThis;
-                    const prop = getPropertyOfType(thisType, declaredProp.escapedName);
-                    const baseProp = getPropertyOfType(baseType, declaredProp.escapedName);
+                const thisType = hasStatic ? staticType : typeWithThis;
+                const baseType = hasStatic ? baseStaticType : baseWithThis;
+                const prop = getPropertyOfType(thisType, declaredProp.escapedName);
+                const baseProp = getPropertyOfType(baseType, declaredProp.escapedName);
 
-                    const baseClassName = typeToString(baseWithThis);
-                    if (prop && !baseProp && hasOverride) {
+                const baseClassName = typeToString(baseWithThis);
+                if (prop && !baseProp && hasOverride) {
+                    if (reportErrors) {
                         const suggestion = getSuggestedSymbolForNonexistentClassMember(symbolName(declaredProp), baseType);
                         suggestion ?
                             error(member, Diagnostics.This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0_Did_you_mean_1, baseClassName, symbolToString(suggestion)) :
                             error(member, Diagnostics.This_member_cannot_have_an_override_modifier_because_it_is_not_declared_in_the_base_class_0, baseClassName);
                     }
-                    else if (prop && baseProp?.declarations && compilerOptions.noImplicitOverride && !nodeInAmbientContext) {
-                        const baseHasAbstract = some(baseProp.declarations, hasAbstractModifier);
-                        if (hasOverride) {
-                            return;
-                        }
+                    return MemberOverrideDiagnostic.HasInvalidOverride;
+                }
+                else if (prop && baseProp?.declarations && compilerOptions.noImplicitOverride && !nodeInAmbientContext) {
+                    const baseHasAbstract = some(baseProp.declarations, hasAbstractModifier);
+                    if (hasOverride) {
+                        return MemberOverrideDiagnostic.Ok;
+                    }
 
-                        if (!baseHasAbstract) {
+                    if (!baseHasAbstract) {
+                        if (reportErrors) {
                             const diag = memberIsParameterProperty ?
                                 Diagnostics.This_parameter_property_must_have_an_override_modifier_because_it_overrides_a_member_in_base_class_0 :
                                 Diagnostics.This_member_must_have_an_override_modifier_because_it_overrides_a_member_in_the_base_class_0;
                             error(member, diag, baseClassName);
                         }
-                        else if (hasAbstractModifier(member) && baseHasAbstract) {
+                        return MemberOverrideDiagnostic.NeedsOverride;
+                    }
+                    else if (hasAbstractModifier(member) && baseHasAbstract) {
+                        if (reportErrors) {
                             error(member, Diagnostics.This_member_must_have_an_override_modifier_because_it_overrides_an_abstract_method_that_is_declared_in_the_base_class_0, baseClassName);
                         }
+                        return MemberOverrideDiagnostic.NeedsOverride;
                     }
                 }
-                else if (hasOverride) {
+            }
+            else if (hasOverride) {
+                if (reportErrors) {
                     const className = typeToString(type);
                     error(member, Diagnostics.This_member_cannot_have_an_override_modifier_because_its_containing_class_0_does_not_extend_another_class, className);
                 }
+                return MemberOverrideDiagnostic.HasInvalidOverride;
             }
+
+            return MemberOverrideDiagnostic.Ok;
         }
 
         function issueMemberSpecificError(node: ClassLikeDeclaration, typeWithThis: Type, baseWithThis: Type, broadDiag: DiagnosticMessage) {
@@ -37927,6 +37976,10 @@ namespace ts {
                     }
                 }
             }
+        }
+
+        function getMemberOverrideModifierDiagnostic(node: ClassLikeDeclaration, member: ClassElement): MemberOverrideDiagnostic {
+            return checkMemberForMissingOverrideModifier(node, staticType, baseStaticType, baseWithThis, type, typeWithThis, member, false, false);
         }
 
         function getTargetSymbol(s: Symbol) {
